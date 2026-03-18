@@ -114,13 +114,79 @@ class Recommender:
         """
         # TODO - complete this method
 
+
+        cursor = None
+
         try:
-            pass
-        except pg.Error as ex:
-            # You may find it helpful to uncomment this line while debugging,
-            # as it will show you all the details of the error that occurred:
-            # raise ex
+            cursor = self.connection.cursor()
+
+            # 1) Clear snapshot tables in dependency-safe order.
+            cursor.execute("DELETE FROM EliteRating;")
+            cursor.execute("DELETE FROM PopularItem;")
+
+            # 2) Rebuild PopularItem.
+            popular_item_query = """
+                WITH item_sales AS (
+                    SELECT i.IID,
+                        i.category,
+                        SUM(li.quantity) AS units_sold
+                    FROM Item i
+                    JOIN LineItem li
+                    ON li.IID = i.IID
+                    GROUP BY i.IID, i.category
+                ),
+                ranked_items AS (
+                    SELECT IID,
+                        category,
+                        units_sold,
+                        DENSE_RANK() OVER (
+                            PARTITION BY category
+                            ORDER BY units_sold DESC
+                        ) AS sales_rank
+                    FROM item_sales
+                ),
+                popular_candidates AS (
+                    SELECT IID
+                    FROM ranked_items
+                    WHERE sales_rank <= 2
+                )
+                INSERT INTO PopularItem (IID, avg_rating)
+                SELECT pc.IID,
+                    AVG(r.rating)::FLOAT AS avg_rating
+                FROM popular_candidates pc
+                LEFT JOIN Review r
+                ON r.IID = pc.IID
+                GROUP BY pc.IID;
+            """
+            cursor.execute(popular_item_query)
+
+            # 3) Rebuild EliteRating from elite-member reviews of popular items.
+            elite_rating_query = """
+                INSERT INTO EliteRating (CID, IID, rating)
+                SELECT em.CID, r.IID, r.rating
+                FROM EliteMember em
+                JOIN Review r
+                ON r.CID = em.CID
+                JOIN PopularItem p
+                ON p.IID = r.IID;
+            """
+            cursor.execute(elite_rating_query)
+
+            self.connection.commit()
+            return True
+
+        except Exception:
+            if self.connection and not self.connection.closed:
+                self.connection.rollback()
             return False
+
+        finally:
+            try:
+                if cursor is not None and not cursor.closed:
+                    cursor.close()
+            except Exception:
+                pass
+
 
     def recommend_generic(self, k: int) -> Optional[list[int]]:
         """Return the item IDs of the <k> recommended items.
@@ -147,15 +213,44 @@ class Recommender:
               It also means that you can get full credit for this method even if
               you didn't implement Recommender.repopulate.
         """
-        # TODO - complete this method
 
+
+        
+        cursor = None
         try:
-            pass
-        except pg.Error as ex:
-            # You may find it helpful to uncomment this line while debugging,
-            # as it will show you all the details of the error that occurred:
-            # raise ex
+            # simple guard against invalid input
+            if k <= 0:
+                return []
+            
+            cursor = self.connection.cursor()
+
+            # the query to get the top k items by average rating, with ties broken by item ID
+            # we disregard items with NULL average rating, as they are considered lower than any non-NULL rating
+            query = """
+                SELECT IID
+                FROM PopularItem
+                WHERE avg_rating IS NOT NULL
+                ORDER BY avg_rating DESC, IID ASC
+                LIMIT %s;
+            """
+            cursor.execute(query, (k,))
+            return [row[0] for row in cursor.fetchall()]
+
+        except Exception:
+            if self.connection and not self.connection.closed:
+                self.connection.rollback()
             return None
+
+        finally:
+            try:
+                if cursor is not None and not cursor.closed:
+                    cursor.close()
+            except Exception:
+                pass
+
+
+
+
 
     def recommend(self, cust: int, k: int) -> Optional[list[int]]:
         """Return the item IDs of the <k> recommended items for customer <cust>
@@ -210,15 +305,91 @@ class Recommender:
               It also means that you can get full credit for this method even if
               you didn't implement Recommender.repopulate.
         """
-        # TODO - complete this method
+        
+        cursor = None
 
         try:
-            pass
-        except pg.Error as ex:
-            # You may find it helpful to uncomment this line while debugging,
-            # as it will show you all the details of the error that occurred:
-            # raise ex
+            if k <= 0:
+                return []
+
+            cursor = self.connection.cursor()
+
+            # 1) Find cust's elite analogous rater:
+            # lowest non-NULL average absolute difference on common popular items.
+            analogous_query = """
+                WITH common_ratings AS (
+                    SELECT er.CID AS elite_cid,
+                        ABS(cr.rating - er.rating) AS diff
+                    FROM EliteRating er
+                    JOIN Review cr
+                    ON cr.IID = er.IID
+                    WHERE cr.CID = %s
+                ),
+                avg_diffs AS (
+                    SELECT elite_cid,
+                        AVG(diff)::FLOAT AS avg_diff
+                    FROM common_ratings
+                    GROUP BY elite_cid
+                )
+                SELECT elite_cid
+                FROM avg_diffs
+                ORDER BY avg_diff ASC, elite_cid ASC
+                LIMIT 1;
+            """
+            cursor.execute(analogous_query, (cust,))
+            row = cursor.fetchone()
+
+            # No elite analogous rater -> fall back to generic recommendations.
+            if row is None:
+                cursor.close()  # close before calling recommend_generic to avoid issues with open cursors
+                return self.recommend_generic(k)
+
+            elite_cid = row[0]
+
+            # 2) Recommend the top-rated items reviewed by the analogous elite
+            # that cust has never bought.
+            recommendation_query = """
+                SELECT r.IID
+                FROM Review r
+                WHERE r.CID = %s
+                AND r.IID NOT IN (
+                    SELECT li.IID
+                    FROM Purchase p
+                    JOIN LineItem li
+                        ON li.PID = p.PID
+                    WHERE p.CID = %s
+                )
+                ORDER BY r.rating DESC, r.IID ASC
+                LIMIT %s;
+            """
+            cursor.execute(recommendation_query, (elite_cid, cust, k))
+
+            recommended = []
+            while True:
+                batch = cursor.fetchmany(1000)
+                if not batch:
+                    break
+                recommended.extend(row[0] for row in batch)
+
+            # If elite has no recommendable items left for cust -> generic fallback.
+            if not recommended:
+                cursor.close()  # close before calling recommend_generic to avoid issues with open cursors
+                return self.recommend_generic(k)
+
+            return recommended
+
+        except Exception:
+            if self.connection and not self.connection.closed:
+                self.connection.rollback()
             return None
+
+        finally:
+            try:
+                if cursor is not None and not cursor.closed:
+                    cursor.close()
+            except Exception:
+                pass
+
 
 
 if __name__ == "__main__":
