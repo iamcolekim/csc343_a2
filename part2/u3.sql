@@ -6,11 +6,21 @@ SET SEARCH_PATH TO Recommender;
 
 -- You may find it convenient to do this for each of the views
 -- that define your intermediate steps. (But give them better names!)
-DROP VIEW IF EXISTS IntermediateStep CASCADE;
+-- DROP VIEW IF EXISTS IntermediateStep CASCADE;
 
 -- Define views for your intermediate steps here:
-CREATE VIEW IntermediateStep AS .
+-- CREATE VIEW IntermediateStep AS .
 
+-- For each customer who placed one or more purchases yesterday,
+-- keep only their first purchase yesterday (by checkout_time).
+
+-- ################
+-- My query below:
+-- ################
+
+DROP VIEW IF EXISTS FirstOrdersYesterday CASCADE;
+
+-- Define views for your intermediate steps here:
 -- For each customer who placed one or more purchases yesterday,
 -- keep only their first purchase yesterday (by checkout_time).
 CREATE VIEW FirstOrdersYesterday AS
